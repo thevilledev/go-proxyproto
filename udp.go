@@ -22,15 +22,16 @@ import (
 // treated as raw payload.
 func ParseUDPDatagram(datagram []byte) (*Header, []byte, error) {
 	byteReader := bytes.NewReader(datagram)
-	// Size the buffer to the whole datagram so the header is fully buffered up
-	// front: v1 parsing aborts if the header is not available in a single read,
-	// and a datagram, unlike a stream, can never deliver more bytes later.
-	// bufio enforces a minimum buffer size internally, covering len == 0.
-	reader := bufio.NewReaderSize(byteReader, len(datagram))
+	// The payload is returned directly from datagram, so buffering all of it
+	// would allocate and copy it unnecessarily. readBufferSize holds a whole
+	// v1 header (at most 107 bytes), as required by its single-read parser.
+	// v2 can read larger headers in chunks from byteReader.
+	reader := bufio.NewReaderSize(byteReader, min(len(datagram), readBufferSize))
 	header, err := Read(reader)
 	if err != nil {
 		return nil, nil, err
 	}
+	// Unread bytes may be buffered or still waiting in byteReader.
 	consumed := len(datagram) - reader.Buffered() - byteReader.Len()
 	return header, datagram[consumed:], nil
 }

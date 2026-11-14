@@ -3,6 +3,7 @@ package proxyproto
 import (
 	"bytes"
 	"errors"
+	"fmt"
 	"net"
 	"testing"
 )
@@ -68,6 +69,55 @@ func TestParseUDPDatagram(t *testing.T) {
 		}
 	})
 
+	t.Run("v2 header larger than the read buffer", func(t *testing.T) {
+		udpHeader := &Header{
+			Version:           2,
+			Command:           PROXY,
+			TransportProtocol: UDPv4,
+			SourceAddr:        &net.UDPAddr{IP: net.ParseIP("10.1.1.1"), Port: 1000},
+			DestinationAddr:   &net.UDPAddr{IP: net.ParseIP("20.2.2.2"), Port: 2000},
+		}
+		tlvs := []TLV{{Type: PP2_TYPE_NOOP, Value: make([]byte, 4*readBufferSize)}}
+		if err := udpHeader.SetTLVs(tlvs); err != nil {
+			t.Fatalf("SetTLVs failed: %v", err)
+		}
+		datagram, err := udpHeader.FormatUDPDatagram(payload)
+		if err != nil {
+			t.Fatalf("FormatUDPDatagram failed: %v", err)
+		}
+
+		h, rest, err := ParseUDPDatagram(datagram)
+		if err != nil {
+			t.Fatalf("datagram was rejected: %v", err)
+		}
+		if !h.EqualsTo(udpHeader) {
+			t.Fatalf("expected %#v, actual %#v", udpHeader, h)
+		}
+		if !bytes.Equal(rest, payload) {
+			t.Fatalf("payload = %q, want %q", rest, payload)
+		}
+	})
+
+	t.Run("longest v1 header with payload larger than the read buffer", func(t *testing.T) {
+		ip := "ffff:ffff:ffff:ffff:ffff:ffff:ffff:ffff"
+		line := "PROXY UNKNOWN " + ip + " " + ip + " 65535 65535" + crlf
+		if len(line) != 107 {
+			t.Fatalf("fixture error: line is %d bytes, want 107", len(line))
+		}
+		large := bytes.Repeat(payload, readBufferSize)
+		datagram := append([]byte(line), large...)
+		h, rest, err := ParseUDPDatagram(datagram)
+		if err != nil {
+			t.Fatalf("datagram was rejected: %v", err)
+		}
+		if h.Version != 1 {
+			t.Fatalf("expected v1 header, got version %d", h.Version)
+		}
+		if !bytes.Equal(rest, large) {
+			t.Fatalf("payload of %d bytes, want %d", len(rest), len(large))
+		}
+	})
+
 	t.Run("header only, empty payload", func(t *testing.T) {
 		datagram := v2Header(byte(PROXY), byte(UDPv4), make([]byte, int(lengthV4)))
 		h, rest, err := ParseUDPDatagram(datagram)
@@ -109,6 +159,34 @@ func TestFormatUDPDatagramError(t *testing.T) {
 	h := &Header{Version: 9}
 	if _, err := h.FormatUDPDatagram([]byte("payload")); !errors.Is(err, ErrUnknownProxyProtocolVersion) {
 		t.Fatalf("expected ErrUnknownProxyProtocolVersion, got %v", err)
+	}
+}
+
+// BenchmarkParseUDPDatagram measures the per-datagram parsing cost, which
+// UDP receivers pay for every datagram (spec section 2), across payload sizes
+// from small packets through a typical QUIC packet and a jumbo frame up to
+// near the UDP maximum.
+func BenchmarkParseUDPDatagram(b *testing.B) {
+	udpHeader := &Header{
+		Version:           2,
+		Command:           PROXY,
+		TransportProtocol: UDPv4,
+		SourceAddr:        &net.UDPAddr{IP: net.ParseIP("10.1.1.1"), Port: 1000},
+		DestinationAddr:   &net.UDPAddr{IP: net.ParseIP("20.2.2.2"), Port: 2000},
+	}
+	for _, size := range []int{64, 1350, 9000, 65000} {
+		datagram, err := udpHeader.FormatUDPDatagram(make([]byte, size))
+		if err != nil {
+			b.Fatalf("FormatUDPDatagram failed: %v", err)
+		}
+		b.Run(fmt.Sprintf("%dB", size), func(b *testing.B) {
+			b.ReportAllocs()
+			for b.Loop() {
+				if _, _, err := ParseUDPDatagram(datagram); err != nil {
+					b.Fatalf("datagram was rejected: %v", err)
+				}
+			}
+		})
 	}
 }
 
